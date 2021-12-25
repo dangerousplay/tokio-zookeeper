@@ -11,7 +11,7 @@ pub use self::watch::*;
 pub mod multi;
 pub use self::multi::*;
 
-use std::net::{AddrParseError, SocketAddr};
+use std::net::{AddrParseError, SocketAddr, ToSocketAddrs};
 use std::str::FromStr;
 
 use itertools::Itertools;
@@ -116,7 +116,7 @@ pub enum ZkConnectStringError {
     EmptyString,
 
     /// An address in the connect string is malformed
-    MalformedAddr,
+    MalformedAddr
 }
 
 impl From<AddrParseError> for ZkConnectStringError {
@@ -129,15 +129,17 @@ impl From<AddrParseError> for ZkConnectStringError {
 /// `ZkConnectString` represents a list of zookeeper addresses to connect to.
 ///
 #[derive(Debug, Clone, PartialEq, Deserialize)]
-pub struct ZkConnectString(Vec<SocketAddr>);
+pub struct ZkConnectString(Vec<String>);
 
 impl ZkConnectString {
     //
-    // Gets a reference to the SocketAddr at the provided index. Returns None
-    // if the index is out of bounds.
+    // Get a connection String resolving to a Socket Address. Returns None
+    // if the index is out of bounds or the given host has no DNS records.
     //
     pub(crate) fn get_addr_at(&self, index: usize) -> Option<SocketAddr> {
-        self.0.get(index).cloned()
+        self.0.get(index)
+            .and_then(|h| h.to_socket_addrs().ok())
+            .and_then(|mut a| a.next())
     }
 
     //
@@ -165,17 +167,16 @@ impl FromStr for ZkConnectString {
         if s.is_empty() {
             return Err(ZkConnectStringError::EmptyString);
         }
-        let acc: Result<Vec<SocketAddr>, Self::Err> = Ok(vec![]);
+        let acc: Result<Vec<String>, Self::Err> = Ok(vec![]);
+
         s.split(',')
-            .map(|x| SocketAddr::from_str(x))
+            .map(|x| x.to_owned())
             .fold(acc, |acc, x| match (acc, x) {
-                (Ok(mut addrs), Ok(addr)) => {
+                (Ok(mut addrs), addr) => {
                     addrs.push(addr);
                     Ok(addrs)
                 }
                 (Err(e), _) => Err(e),
-                (_, Err(e)) => Err(ZkConnectStringError::from(e)),
-            })
-            .and_then(|x| Ok(ZkConnectString(x)))
+            }).map(ZkConnectString)
     }
 }

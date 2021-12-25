@@ -35,6 +35,9 @@ pub(crate) enum Response {
         acl: Vec<Acl>,
         stat: Stat,
     },
+    SetSasl {
+        token: Vec<u8>
+    },
     Empty,
     Strings(Vec<String>),
     String(String),
@@ -180,6 +183,7 @@ impl Response {
                 acl: Vec::<Acl>::read_from(reader)?,
                 stat: Stat::read_from(reader)?,
             }),
+            OpCode::Sasl => Ok(Response::SetSasl { token: reader.read_buffer()? }),
             OpCode::Multi => {
                 let mut responses = Vec::new();
                 loop {
@@ -197,6 +201,9 @@ impl Response {
                 Ok(Response::Multi(responses))
             }
             OpCode::SetWatches | OpCode::CloseSession | OpCode::Delete | OpCode::Check => {
+                Ok(Response::Empty)
+            }
+            OpCode::Auth => {
                 Ok(Response::Empty)
             }
             _ => panic!("got unexpected response opcode {:?}", opcode),

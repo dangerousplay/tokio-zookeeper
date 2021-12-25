@@ -59,6 +59,14 @@ pub(crate) enum Request {
         acl: Cow<'static, [Acl]>,
         version: i32,
     },
+    GetSasl {
+        token: Vec<u8>
+    },
+    Auth {
+        type_: i32,
+        scheme: Cow<'static, str>,
+        auth: Cow<'static, [u8]>
+    },
     Check {
         path: String,
         version: i32,
@@ -273,6 +281,14 @@ impl Request {
                 write_list(buffer, acl);
                 buffer.put_i32(version);
             }
+            Request::GetSasl { ref token } => {
+                token.write_to(buffer);
+            }
+            Request::Auth { ref auth, ref scheme, type_ } => {
+                buffer.put_i32(type_);
+                scheme.to_string().write_to(buffer);
+                auth.write_to(buffer);
+            }
             Request::Check { ref path, version } => {
                 path.write_to(buffer);
                 buffer.put_i32(version);
@@ -314,6 +330,8 @@ impl Request {
             Request::Multi { .. } => OpCode::Multi,
             Request::SetWatches { .. } => OpCode::SetWatches,
             Request::Check { .. } => OpCode::Check,
+            Request::GetSasl { .. } => OpCode::Sasl,
+            Request::Auth { .. } => OpCode::Auth
         }
     }
 }
