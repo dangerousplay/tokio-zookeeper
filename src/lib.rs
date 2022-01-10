@@ -115,6 +115,7 @@ pub(crate) mod backoff;
 pub(crate) mod client;
 pub(crate) mod session_manager;
 pub(crate) mod transform;
+pub(crate) mod sasl_digest;
 
 use std::borrow::Cow;
 use std::time;
@@ -132,6 +133,7 @@ use crate::proto::response::Response;
 use crate::session_manager::LONG_TIMEOUT;
 use crate::types::watch::WatchOption;
 use crate::types::{Acl, CreateMode, MultiResponse, Stat, WatchedEvent, ZkConnectString};
+use sasl::common::{Credentials, Identity, Secret};
 
 // TODO Enforce path constraints?
 // https://zookeeper.apache.org/doc/r3.4.12/zookeeperProgrammers.html#ch_zkDataModel
@@ -226,24 +228,74 @@ impl ZooKeeperBuilder {
     pub async fn connect(
         self,
         conn_str: &ZkConnectString,
-    ) -> (ZooKeeper, UnboundedReceiver<WatchedEvent>) {
+    ) -> Result<(ZooKeeper, UnboundedReceiver<WatchedEvent>), failure::Error> {
+        self.inner_connect(conn_str, None).await
+    }
+
+    ///
+    /// Connect to a ZooKeeper server instance at the given address.
+    ///
+    /// This function returns a `ZooKeeper` instance, along with a default
+    /// watcher that will provide notifications of server state changes and
+    /// watches on ZooKeeper nodes.
+    ///
+    /// This function cannot fail. The client will repeatedly attempt to connect
+    /// to the server (with exponential backoff) until the session is
+    /// established. There is no upper bound on the time to connect, because the
+    /// session hasn't been established yet, so there is no session to time out.
+    ///
+    /// If the servers in the cluster become unreachable, the client will
+    /// attempt to reconnect until the session timeout expires. Only then should
+    /// the application call connect() again.
+    ///
+    pub async fn connect_with_sasl(
+        self,
+        conn_str: &ZkConnectString,
+        credentials: Credentials,
+    ) -> Result<(ZooKeeper, UnboundedReceiver<WatchedEvent>), failure::Error> {
+        self.inner_connect(conn_str, Some(credentials)).await
+    }
+
+
+    async fn inner_connect(self,
+                     conn_str: &ZkConnectString,
+                     credentials: Option<Credentials>
+    ) -> Result<(ZooKeeper, UnboundedReceiver<WatchedEvent>), failure::Error> {
         let log = self.logger.clone();
         let (tx, rx) = mpsc::unbounded();
+
+        ZooKeeperBuilder::validate_credentials(&credentials)?;
+
         let enqueuer = SharedState::start(
             conn_str.clone(),
             tx,
             self.session_timeout,
             self.read_only,
+            credentials,
             log,
         )
-        .await;
-        (
+            .await;
+        Ok((
             ZooKeeper {
                 connection: enqueuer,
                 logger: self.logger,
             },
             rx,
-        )
+        ))
+    }
+
+    fn validate_credentials(credentials: &Option<Credentials>) -> Result<(), error::AuthSasl> {
+        if let Some(ref credentials) = credentials {
+            if let Identity::None = credentials.identity {
+                return Err(error::AuthSasl::BadCredentials { reason: "Identity not specified" });
+            }
+
+            if let Secret::None = credentials.secret {
+                return Err(error::AuthSasl::BadCredentials { reason: "secret not provided" });
+            }
+        }
+
+        Ok(())
     }
 
     ///
@@ -266,6 +318,18 @@ impl ZooKeeperBuilder {
     pub fn set_logger(&mut self, l: slog::Logger) {
         self.logger = l;
     }
+
+    ///
+    /// Set the logger that should be used internally in the ZooKeeper client.
+    ///
+    /// By default, the log level is set to `Info` and logs are written to
+    /// stdout.See also [the `slog` documentation](https://docs.rs/slog).
+    ///
+    pub fn with_logger(mut self, l: slog::Logger) -> Self {
+        self.logger = l;
+        self
+    }
+
 }
 
 impl ZooKeeper {
@@ -274,8 +338,17 @@ impl ZooKeeper {
     ///
     /// See [`ZooKeeperBuilder::connect`].
     ///
-    pub async fn connect(conn_str: &ZkConnectString) -> (Self, UnboundedReceiver<WatchedEvent>) {
+    pub async fn connect(conn_str: &ZkConnectString) ->  Result<(Self, UnboundedReceiver<WatchedEvent>), failure::Error> {
         ZooKeeperBuilder::default().connect(conn_str).await
+    }
+
+    ///
+    /// Connect to a ZooKeeper server instance at the given address with default parameters.
+    ///
+    /// See [`ZooKeeperBuilder::connect`].
+    ///
+    pub async fn connect_sasl(conn_str: &ZkConnectString, credentials: Credentials) -> Result<(Self, UnboundedReceiver<WatchedEvent>), failure::Error> {
+        ZooKeeperBuilder::default().connect_with_sasl(conn_str, credentials).await
     }
 
     ///

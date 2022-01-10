@@ -14,7 +14,7 @@ use futures::future::{AbortHandle, Abortable};
 use futures::lock::Mutex as AsyncMutex;
 use futures::sink::SinkExt;
 use futures::stream::StreamExt;
-use slog::{debug, error, info, Logger};
+use slog::{debug, error, info, Logger, warn};
 use tokio::io::{ReadHalf, WriteHalf};
 use tokio::net::TcpStream;
 use tokio::sync::{Barrier, Notify};
@@ -24,14 +24,22 @@ use tokio_util::codec::{FramedRead, FramedWrite};
 use crate::error::{InternalError, ZkError};
 use crate::proto::decoder::ZkDecoder;
 use crate::proto::encoder::{RequestWrapper, ZkEncoder};
-use crate::proto::request::{OpCode, Request};
+use crate::proto::request::{OpCode, Request, TransformRequestPath};
 use crate::proto::response::{Response, FIRST_XID, HEARTBEAT_XID, SHUTDOWN_XID, WATCH_XID};
 use crate::session_manager::SessionManager;
 use crate::types::watch::{KeeperState, Watch, WatchOption, WatchType, WatchedEvent};
 use crate::types::ZkConnectString;
+use sasl::common::{Credentials, Identity, Secret, Password};
+use crate::sasl_digest::MD5;
+use sasl::client::Mechanism;
+use tokio::time::timeout;
+use crate::{transform, error};
 
 pub(crate) type ReplyRecord = (OpCode, Sender<Result<Response, ZkError>>);
 pub(crate) type RequestTuple = (Request, Sender<Result<Response, ZkError>>);
+
+
+const LOGIN_TIMEOUT: Duration = Duration::from_secs(10);
 
 //
 // This struct exists so the enqueuer can communicate with the client's
@@ -57,7 +65,7 @@ impl Drop for TaskTracker {
         // and decoder again.
         //
         info!(self.log, "Enqueuer dropped");
-        self.notify.notify();
+        self.notify.notify_one();
     }
 }
 
@@ -103,6 +111,8 @@ pub(crate) struct SharedState {
     // Global map of watches registered, indexed by path
     watches: Arc<Mutex<HashMap<String, Vec<Watch>>>>,
 
+    credentials: Option<Credentials>,
+
     // Default watcher for state change events and non-custom watch events
     default_watcher: UnboundedSender<WatchedEvent>,
 
@@ -118,6 +128,7 @@ impl SharedState {
         default_watcher: UnboundedSender<WatchedEvent>,
         session_timeout: Duration,
         read_only: bool,
+        sasl_credentials: Option<Credentials>,
         log: slog::Logger,
     ) -> Enqueuer {
         //
@@ -195,6 +206,7 @@ impl SharedState {
                 replies,
                 pending_watches: Arc::new(Mutex::new(HashMap::new())),
                 watches,
+                credentials: sasl_credentials,
                 default_watcher,
             };
             match s.run(bg_barrier, abort_handles).await {
@@ -255,7 +267,6 @@ impl SharedState {
             // Allow the initial call to start() to resolve
             if first {
                 first = false;
-                barrier.wait().await;
             } else {
                 self.replies.lock().unwrap().clear();
                 self.pending_watches.lock().unwrap().clear();
@@ -295,6 +306,26 @@ impl SharedState {
                 dec_abort_registration,
             ));
 
+            // TODO better authentication error handling
+            match timeout(LOGIN_TIMEOUT, self.sasl_login()).await {
+                Ok(Err(e)) => {
+                    warn!(self.log, "Failed to SASL Login: {:?}", e);
+
+                    return Err(InternalError::ConnectionEnded)
+                },
+                Err(e) => {
+                    warn!(self.log, "Failed to SASL Login: {:?}", e);
+
+                    self.notify_state_change(KeeperState::Disconnected);
+
+                    continue
+                },
+                Ok(_) => {}
+            }
+
+            //Wait for SASL login to process requests
+            barrier.wait().await;
+
             //
             // These futures below _never exit unless they fail_, which is why
             // they return an error as their "Ok" value.
@@ -328,6 +359,55 @@ impl SharedState {
                 *abort_handles = None;
             }
         }
+    }
+
+    async fn sasl_login(&mut self) -> Result<Result<(), error::AuthSasl>, failure::Error> {
+        if let Some(credentials) = self.credentials.clone() {
+
+            let username = match credentials.identity.clone() {
+                Identity::None => unreachable!(),
+                Identity::Username(user) => user
+            };
+
+            let password = match credentials.secret.clone() {
+                Secret::None => unreachable!(),
+                Secret::Password(pass) => pass
+            };
+
+            let password = match password {
+                Password::Plain(p) => p,
+                _ => unreachable!()
+            };
+
+
+            let challenge = self.enqueue(Request::GetSasl { token: [].into() }).await
+                .and_then(transform::get_sasl)
+                .map_err(|e| format_err!("Failed to get SASL Challenge: {:?}", e))??;
+
+            let mut mechanism = MD5::from_credentials(credentials).expect("No error, this is a bug");
+
+            let challenge_response = mechanism.response(&challenge)
+                .map_err(|e| format_err!("Failed to solve challenge {}", e))?;
+
+            let response = self.enqueue(Request::GetSasl { token: challenge_response })
+                .await
+                .and_then(transform::get_sasl)
+                .map_err(|e| format_err!("Failed to SASL Challenge: {}", e))?;
+
+            if let Err(e) = response {
+                return Ok(Err(e))
+            }
+
+            let auth_data = format!("{}:{}", username, password);
+
+            self.enqueue(Request::Auth { type_: 0, scheme: "digest".into(), auth: auth_data.into_bytes().into() })
+                .await
+                .and_then(transform::auth_info)?;
+
+            self.notify_state_change(KeeperState::SaslAuthenticated);
+        }
+
+        Ok(Ok(()))
     }
 
     //
@@ -382,6 +462,32 @@ impl SharedState {
             .unbounded_send(WatchedEvent::state_event(state));
     }
 
+    async fn recv_msg(
+        decoder: &mut FramedRead<ReadHalf<TcpStream>, ZkDecoder>,
+        sess_mgr: SessionManager,
+        log: Logger,
+    ) -> Result<(), InternalError> {
+        match decoder.next().await {
+            Some(item) => {
+                match item? {
+                    //
+                    // The decoder encountered some server error to be
+                    // handled internally, or client logic error. We can't
+                    // really do anything, so we just log the error.
+                    //
+                    // TODO These happened in the old client, but I'm not
+                    // sure that these should ever happen here --
+                    // should we panic instead in decoder if they do?
+                    //
+                    Err(e) => error!(log, "Server Error; doing nothing: {:?}", e),
+                    Ok(zxid) => sess_mgr.set_zxid(zxid).await,
+                }
+                Ok(())
+            }
+            None => Err(InternalError::ConnectionEnded),
+        }
+    }
+
     //
     // Decoder task. Accepts a handle to the encoder task so it can abort the
     // encoder if the connection is lost.
@@ -391,32 +497,6 @@ impl SharedState {
         rx: ReadHalf<TcpStream>,
         enc_abort_handle: AbortHandle,
     ) -> InternalError {
-        async fn recv_msg(
-            decoder: &mut FramedRead<ReadHalf<TcpStream>, ZkDecoder>,
-            sess_mgr: SessionManager,
-            log: Logger,
-        ) -> Result<(), InternalError> {
-            match decoder.next().await {
-                Some(item) => {
-                    match item? {
-                        //
-                        // The decoder encountered some server error to be
-                        // handled internally, or client logic error. We can't
-                        // really do anything, so we just log the error.
-                        //
-                        // TODO These happened in the old client, but I'm not
-                        // sure that these should ever happen here --
-                        // should we panic instead in decoder if they do?
-                        //
-                        Err(e) => error!(log, "Server Error; doing nothing: {:?}", e),
-                        Ok(zxid) => sess_mgr.set_zxid(zxid).await,
-                    }
-                    Ok(())
-                }
-                None => Err(InternalError::ConnectionEnded),
-            }
-        }
-
         let mut decoder = FramedRead::new(
             rx,
             ZkDecoder::new(
@@ -429,7 +509,7 @@ impl SharedState {
         );
 
         loop {
-            if let Err(e) = recv_msg(&mut decoder, self.sess_mgr.clone(), self.log.clone()).await {
+            if let Err(e) = Self::recv_msg(&mut decoder, self.sess_mgr.clone(), self.log.clone()).await {
                 //
                 // The stream encountered an unrecoverable error. We stop the
                 // encoder and then exit ourselves.
@@ -459,6 +539,7 @@ impl SharedState {
         loop {
             let timeout_result =
                 time::timeout(heartbeat_interval, self.rx.lock().await.next()).await;
+
             let (mut request, response_tx) = match timeout_result {
                 Err(_) => {
                     //
@@ -484,20 +565,12 @@ impl SharedState {
             let new_xid = if let Request::Close = request {
                 SHUTDOWN_XID
             } else {
-                let mut xid_handle = self.xid.lock().await;
-                // Skip special xids
-                while *xid_handle == SHUTDOWN_XID
-                    || *xid_handle == WATCH_XID
-                    || *xid_handle == HEARTBEAT_XID
-                {
-                    *xid_handle += 1;
-                }
-                let new_xid = *xid_handle;
-                *xid_handle += 1;
-                new_xid
+                self.generate_xid().await
             };
 
-            info!(self.log, "enqueueing request {:?}", request; "xid" => new_xid);
+            debug!(self.log, "enqueueing request {:?}", request; "xid" => new_xid);
+
+            self.preprocess_request(&mut request).await;
 
             // Register a watch, if necessary
             match request {
@@ -576,6 +649,59 @@ impl SharedState {
             }
         }
     }
+
+    async fn enqueue(
+        &self,
+        request: Request,
+    ) -> Result<Result<Response, ZkError>, failure::Error> {
+        let (tx, rx) = oneshot::channel();
+        match self.req_tx.unbounded_send((request, tx)) {
+            Ok(()) => rx
+                .await
+                .map_err(|e| format_err!("Error processing request: {:?}", e)),
+            Err(e) => Err(format_err!("failed to enqueue new request: {:?}", e)),
+        }
+    }
+
+    async fn generate_xid(&mut self) -> i32 {
+        let mut xid_handle = self.xid.lock().await;
+        // Skip special xids
+        while *xid_handle == SHUTDOWN_XID
+            || *xid_handle == WATCH_XID
+            || *xid_handle == HEARTBEAT_XID
+        {
+            *xid_handle += 1;
+        }
+        let new_xid = *xid_handle;
+        *xid_handle += 1;
+        new_xid
+    }
+
+    async fn preprocess_request(&self, request: &mut Request) {
+        let base_path = self.sess_mgr.get_base_path().await;
+
+        Self::append_base_path(request, base_path);
+    }
+
+    fn append_base_path(request: &mut Request, base_path: Option<String>) {
+        request.transform_path(move |original_path| {
+            let new_path = base_path
+                .map(|b| {
+                    let mut path = format!("/{}", b);
+
+                    if !original_path.starts_with('/') {
+                        path.push('/');
+                    }
+
+                    path.push_str(original_path);
+                    path
+                })
+                .unwrap_or_else(|| original_path.clone());
+
+            original_path.drain(..original_path.len());
+            original_path.push_str(&new_path);
+        });
+    }
 }
 
 //
@@ -604,4 +730,42 @@ impl Enqueuer {
             Err(e) => Err(format_err!("failed to enqueue new request: {:?}", e)),
         }
     }
+}
+
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_append_base_path() {
+        let path = "node".to_string();
+        let mut request = Request::GetData { path: path.clone(), watch: WatchOption::None };
+
+        let base_path = Some("base".to_string());
+        let expected = format!("/{}/{}", base_path.clone().unwrap(), path);
+
+        SharedState::append_base_path(&mut request, base_path);
+
+        match request {
+            Request::GetData { path: actual, .. } =>  assert_eq!(actual, expected),
+            _ => unreachable!()
+        }
+    }
+
+    #[test]
+    fn test_append_without_base_path() {
+        let path = "node".to_string();
+        let mut request = Request::GetData { path: path.clone(), watch: WatchOption::None };
+
+        let expected = path;
+
+        SharedState::append_base_path(&mut request, None);
+
+        match request {
+            Request::GetData { path: actual, .. } =>  assert_eq!(actual, expected),
+            _ => unreachable!()
+        }
+    }
+
 }

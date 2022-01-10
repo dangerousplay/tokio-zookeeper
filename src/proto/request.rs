@@ -335,3 +335,24 @@ impl Request {
         }
     }
 }
+
+pub trait TransformRequestPath {
+    fn transform_path(&mut self, op: impl FnOnce(&mut String));
+}
+
+impl TransformRequestPath for Request {
+    fn transform_path(&mut self, op: impl FnOnce(&mut String)) {
+        match self {
+            Request::GetAcl { path, .. } => op(path),
+            Request::Exists { path, .. } => op(path),
+            Request::Delete { path, .. } => op(path),
+            Request::SetData { path,.. } => op(path),
+            Request::Create { path, .. } => op(path),
+            Request::GetChildren { path, .. } => op(path),
+            Request::GetData { path, .. } =>  op(path),
+            Request::SetAcl { path, .. } =>  op(path),
+            Request::Check { path , .. } => op(path),
+            _ => {}
+        }
+    }
+}

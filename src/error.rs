@@ -201,6 +201,26 @@ pub enum Delete {
     /// The target node has child nodes, and therefore cannot be deleted.
     #[fail(display = "target node has children, and cannot be deleted")]
     NotEmpty,
+
+    #[fail(display = "insufficient authentication")]
+    NoAuth,
+}
+
+///
+/// Errors that may cause a `sasl` login request to fail.
+///
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Fail)]
+pub enum AuthSasl {
+
+    /// Invalid credentials
+    #[fail(display = "Authentication failed, invalid credentials")]
+    AuthFailed,
+
+    /// Bad credentials
+    #[fail(display = "bad credentials: {}", reason)]
+    BadCredentials {
+        reason: &'static str
+    }
 }
 
 ///

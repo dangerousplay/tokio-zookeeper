@@ -33,6 +33,13 @@ impl Encoder<RequestWrapper> for ZkEncoder {
     type Error = IoError;
 
     fn encode(&mut self, item: RequestWrapper, dst: &mut BytesMut) -> Result<(), Self::Error> {
+
+        //Ensure that buffer capacity is at least header size + 1
+        let size = dst.capacity();
+        if size <= HEADER_SIZE {
+            dst.reserve(HEADER_SIZE + 1 - size);
+        }
+
         // Set aside bytes at beginning of buffer for message length
         let mut buf = dst.split_off(HEADER_SIZE);
 

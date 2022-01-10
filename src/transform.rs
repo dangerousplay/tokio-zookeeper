@@ -48,6 +48,7 @@ pub(crate) fn delete(
         Ok(r) => bail!("got non-empty response to delete: {:?}", r),
         Err(ZkError::NoNode) => Ok(Err(error::Delete::NoNode)),
         Err(ZkError::NotEmpty) => Ok(Err(error::Delete::NotEmpty)),
+        Err(ZkError::NoAuth) => Ok(Err(error::Delete::NoAuth)),
         Err(ZkError::BadVersion) => Ok(Err(error::Delete::BadVersion { expected: version })),
         Err(e) => Err(format_err!("delete call failed: {:?}", e)),
     }
@@ -120,6 +121,24 @@ pub(crate) fn check(
         Err(ZkError::NoNode) => Ok(Err(error::Check::NoNode)),
         Err(ZkError::BadVersion) => Ok(Err(error::Check::BadVersion { expected: version })),
         Err(e) => bail!("check call failed: {:?}", e),
+    }
+}
+
+
+pub(crate) fn get_sasl(res: Result<Response, ZkError>) -> Result<Result<Vec<u8>, error::AuthSasl>, failure::Error> {
+    match res {
+        Ok(Response::SetSasl { token }) => Ok(Ok(token)),
+        Err(ZkError::AuthFailed) => Ok(Err(error::AuthSasl::AuthFailed)),
+        Ok(r) => bail!("got a token response to a get sasl request: {:?}", r),
+        Err(e) => bail!("get sasl failed: {:?}", e),
+    }
+}
+
+pub(crate) fn auth_info(res: Result<Response, ZkError>) -> Result<(), failure::Error> {
+    match res {
+        Ok(Response::Empty) => Ok(()),
+        Ok(r) => bail!("got a non auth info response: {:?}", r),
+        Err(e) => bail!("auth info failed: {:?}", e),
     }
 }
 

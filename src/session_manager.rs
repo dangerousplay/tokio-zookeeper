@@ -125,6 +125,10 @@ impl ZkConnectStringState {
         ret
     }
 
+    pub fn base_path(&self) -> Option<&String> {
+        self.conn_str.base_path()
+    }
+
     pub(crate) fn reset_attempts(&mut self) {
         self.conn_attempts = 0;
     }
@@ -206,7 +210,7 @@ impl SessionManager {
                 "Delaying";
                 "delay_ms" => delay.as_millis()
             );
-            time::delay_for(delay).await;
+            time::sleep(delay).await;
             let result = self.reconnect_inner().await;
             if let Err(e) = result {
                 error!(self.log, "Error connecting to ZooKeeper: {:?}", e);
@@ -328,6 +332,7 @@ impl SessionManager {
             //
             unreachable!("Parsed response is not a Response::Connect");
         }
+
         Ok((conn_tx, conn_rx))
     }
 
@@ -362,6 +367,11 @@ impl SessionManager {
             );
             session_info.last_zxid_seen = zxid;
         }
+    }
+
+    pub(crate) async fn get_base_path(&self) -> Option<String> {
+        self.conn_str_state.lock().await
+            .base_path().cloned()
     }
 
     pub(crate) async fn get_zxid(&self) -> i64 {

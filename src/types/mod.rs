@@ -17,6 +17,10 @@ use std::str::FromStr;
 use itertools::Itertools;
 use serde::Deserialize;
 
+const ADDRESS_SEPARATOR: &str = ",";
+const ADDRESS_BASE_PATH_SEPARATOR: &str = "/";
+
+
 ///
 /// Statistics about a znode, similar to the UNIX `stat` structure.
 ///
@@ -129,7 +133,7 @@ impl From<AddrParseError> for ZkConnectStringError {
 /// `ZkConnectString` represents a list of zookeeper addresses to connect to.
 ///
 #[derive(Debug, Clone, PartialEq, Deserialize)]
-pub struct ZkConnectString(Vec<String>);
+pub struct ZkConnectString(Vec<String>, Option<String>);
 
 impl ZkConnectString {
     //
@@ -140,6 +144,10 @@ impl ZkConnectString {
         self.0.get(index)
             .and_then(|h| h.to_socket_addrs().ok())
             .and_then(|mut a| a.next())
+    }
+
+    pub(crate) fn base_path(&self) -> Option<&String> {
+        self.1.as_ref()
     }
 
     //
@@ -167,9 +175,24 @@ impl FromStr for ZkConnectString {
         if s.is_empty() {
             return Err(ZkConnectStringError::EmptyString);
         }
+
         let acc: Result<Vec<String>, Self::Err> = Ok(vec![]);
 
-        s.split(',')
+        let base_path: Vec<&str> = s.split(ADDRESS_BASE_PATH_SEPARATOR).collect();
+
+        let addrs = base_path.first().copied().unwrap_or(s);
+
+        let base_path: Vec<String> = base_path.iter().skip(1)
+            .map(|s| s.to_string())
+            .collect();
+
+        let base_path = if base_path.is_empty() {
+            None
+        } else {
+            Some(base_path.join(ADDRESS_BASE_PATH_SEPARATOR))
+        };
+
+        addrs.split(ADDRESS_SEPARATOR)
             .map(|x| x.to_owned())
             .fold(acc, |acc, x| match (acc, x) {
                 (Ok(mut addrs), addr) => {
@@ -177,6 +200,54 @@ impl FromStr for ZkConnectString {
                     Ok(addrs)
                 }
                 (Err(e), _) => Err(e),
-            }).map(ZkConnectString)
+            }).map(|addrs| ZkConnectString(addrs, base_path))
     }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::types::ZkConnectStringError;
+    use crate::ZkConnectString;
+
+    #[test]
+    fn parse_address_base_path() {
+        let addresses = vec![
+            "127.0.0.1",
+            "128.0.0.1",
+            "129.0.0.1",
+        ];
+
+        let address = addresses.join(",");
+
+        let base_path = "broker/path";
+        let address_with_base = format!("{}/{}", address, base_path);
+
+        let result: Result<ZkConnectString, ZkConnectStringError> = address_with_base.parse();
+
+        assert!(result.is_ok(), "Should parse zookeeper string");
+
+        let actual = result.unwrap();
+
+        let actual_base_path = actual.1.expect("Base path exists");
+
+        assert_eq!(actual_base_path, base_path);
+
+        assert_eq!(actual.0, addresses);
+    }
+
+    #[test]
+    fn parse_address() {
+        let address = "127.0.0.1";
+
+        let result: Result<ZkConnectString, ZkConnectStringError> = address.parse();
+
+        assert!(result.is_ok(), "Should parse zookeeper string");
+
+        let actual = result.unwrap();
+
+        assert_eq!(actual.1, None);
+
+        assert_eq!(actual.0, vec![address]);
+    }
+
 }
