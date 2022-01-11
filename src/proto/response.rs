@@ -12,17 +12,21 @@ use crate::types::acl::Acl;
 use crate::types::watch::{WatchedEvent, WatchedEventType};
 use crate::types::{KeeperState, Permission, Stat};
 
+use derivative::Derivative;
+
 pub(crate) const SHUTDOWN_XID: i32 = 0;
 pub(crate) const WATCH_XID: i32 = -1;
 pub(crate) const HEARTBEAT_XID: i32 = -2;
 pub(crate) const FIRST_XID: i32 = 1;
 
-#[derive(Debug)]
+#[derive(Derivative)]
+#[derivative(Debug)]
 pub(crate) enum Response {
     Connect {
         protocol_version: i32,
         timeout: i32,
         session_id: i64,
+        #[derivative(Debug="ignore")]
         password: Vec<u8>,
         read_only: bool,
     },

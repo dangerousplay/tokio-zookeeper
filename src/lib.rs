@@ -97,9 +97,9 @@
 //! Within that context, you can `await` them.
 //!
 //! # An example
-//!
+//! TODO: write example
 //! ```no_run
-//! TODO write an example
+//!
 //! ```
 //!
 
