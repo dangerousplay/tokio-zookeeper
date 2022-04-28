@@ -32,8 +32,8 @@ serde = { version ="1.0", features = ["derive"]}
 slog = "2.5"
 slog-async = "2.5"
 slog-bunyan = "2.2"
-tokio = { version = "1.15.0", features = ["io-util", "sync", "net", "macros", "rt", "time"] }
-tokio-util = { version = "0.6.9", features = ["codec"] }
+tokio = { version = "1.18.0", features = ["io-util", "sync", "net", "macros", "rt", "time", "tracing"] }
+tokio-util = { version = "0.7.1", features = ["codec"] }
 sasl = "0.4.3"
 md-5 = "0.9.1"
 hmac = "0.9.0"
